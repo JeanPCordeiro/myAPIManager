@@ -1,0 +1,26 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: sidecar-proxy
+  cloud:
+    gateway:
+      routes:
+        - id: resource-service-route
+          uri: http://localhost:8082
+          predicates:
+            - Path=/**
+          filters:
+            - RemoveRequestHeader=Cookie
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:8081/issuer
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics

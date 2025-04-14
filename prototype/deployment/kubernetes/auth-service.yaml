@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: api-security
+  labels:
+    app: auth-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8081"
+    spec:
+      containers:
+      - name: auth-service
+        image: api-security/auth-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8081
+        env:
+        - name: SPRING_CONFIG_LOCATION
+          value: file:/config/auth-service.yml
+        - name: SPRING_PROFILES_ACTIVE
+          value: prod
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-security-secrets
+              key: jwt-secret
+        - name: ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: api-security-secrets
+              key: admin-password
+        - name: USER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: api-security-secrets
+              key: user-password
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        - name: data-volume
+          mountPath: /data
+        resources:
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8081
+          initialDelaySeconds: 60
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: config-volume
+        configMap:
+          name: api-security-config
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: auth-service-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: api-security
+spec:
+  selector:
+    app: auth-service
+  ports:
+  - port: 8081
+    targetPort: 8081
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auth-service-data
+  namespace: api-security
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

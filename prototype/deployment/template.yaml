@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Socle technique pour sécuriser des ressources REST
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Environnement de déploiement
+
+Resources:
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Auth:
+        DefaultAuthorizer: JwtAuthorizer
+        Authorizers:
+          JwtAuthorizer:
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}
+              audience:
+                - !Ref CognitoUserPoolClient
+            IdentitySource: "$request.header.Authorization"
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseTemplates:
+            application/json: '{"message":"Erreur d''authentification ou d''autorisation", "error":"$context.error.message"}'
+        DEFAULT_5XX:
+          ResponseTemplates:
+            application/json: '{"message":"Erreur interne du serveur", "error":"$context.error.message"}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+
+  # Cognito User Pool pour l'authentification
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub api-security-user-pool-${Environment}
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "OFF"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+
+  # Client pour le User Pool
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub api-security-client-${Environment}
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - resource/read
+        - resource/write
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # Lambda pour l'API Gateway
+  ApiGatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./api-gateway
+      Handler: com.example.apigateway.LambdaHandler::handleRequest
+      Runtime: java11
+      MemorySize: 1024
+      Timeout: 30
+      Environment:
+        Variables:
+          SPRING_PROFILES_ACTIVE: !Ref Environment
+          AUTH_SERVICE_URL: !Sub https://${AuthServiceFunction.Alias}.lambda-url.${AWS::Region}.on.aws
+          RESOURCE_SERVICE_URL: !Sub https://${ResourceServiceFunction.Alias}.lambda-url.${AWS::Region}.on.aws
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /{proxy+}
+            Method: ANY
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !GetAtt AuthServiceFunction.Arn
+                - !GetAtt ResourceServiceFunction.Arn
+
+  # Lambda pour le service d'authentification
+  AuthServiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./auth-service
+      Handler: com.example.authservice.LambdaHandler::handleRequest
+      Runtime: java11
+      MemorySize: 1024
+      Timeout: 30
+      Environment:
+        Variables:
+          SPRING_PROFILES_ACTIVE: !Ref Environment
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminInitiateAuth
+                - cognito-idp:AdminCreateUser
+              Resource: !GetAtt CognitoUserPool.Arn
+
+  # Lambda pour le service de ressources
+  ResourceServiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./resource-service
+      Handler: com.example.resourceservice.LambdaHandler::handleRequest
+      Runtime: java11
+      MemorySize: 1024
+      Timeout: 30
+      Environment:
+        Variables:
+          SPRING_PROFILES_ACTIVE: !Ref Environment
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  # ElastiCache Redis pour la limitation de débit
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Redis cluster
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for Redis cluster
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      CacheNodeType: cache.t3.micro
+      Engine: redis
+      NumCacheNodes: 1
+      VpcSecurityGroupIds:
+        - !GetAtt RedisSecurityGroup.GroupId
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+
+  # VPC pour le déploiement
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub api-security-vpc-${Environment}
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub api-security-private-subnet-1-${Environment}
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub api-security-private-subnet-2-${Environment}
+
+Outputs:
+  ApiGatewayUrl:
+    Description: URL de l'API Gateway
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+
+  CognitoUserPoolId:
+    Description: ID du Cognito User Pool
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Description: ID du client Cognito User Pool
+    Value: !Ref CognitoUserPoolClient

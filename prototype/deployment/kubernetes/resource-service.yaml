@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resource-service
+  namespace: api-security
+  labels:
+    app: resource-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: resource-service
+  template:
+    metadata:
+      labels:
+        app: resource-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8082"
+    spec:
+      containers:
+      - name: resource-service
+        image: api-security/resource-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8082
+        env:
+        - name: SPRING_CONFIG_LOCATION
+          value: file:/config/resource-service.yml
+        - name: SPRING_PROFILES_ACTIVE
+          value: prod
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        resources:
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8082
+          initialDelaySeconds: 60
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8082
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      - name: sidecar-proxy
+        image: api-security/sidecar-proxy:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8090
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: prod
+        - name: AUTH_SERVICE_URL
+          value: http://auth-service:8081
+        - name: RESOURCE_SERVICE_URL
+          value: http://localhost:8082
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-security-secrets
+              key: jwt-secret
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8090
+          initialDelaySeconds: 60
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8090
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: config-volume
+        configMap:
+          name: api-security-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resource-service
+  namespace: api-security
+spec:
+  selector:
+    app: resource-service
+  ports:
+  - port: 8082
+    targetPort: 8090  # Le trafic est dirigé vers le sidecar-proxy
+  type: ClusterIP
